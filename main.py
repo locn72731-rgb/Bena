@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import audioop
+import traceback
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
@@ -9,26 +10,25 @@ from google.genai import types
 
 app = FastAPI()
 
-# ==============================
-# CẤU HÌNH GEMINI
-# ==============================
+# =================================
+# CẤU HÌNH
+# =================================
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
-MODEL = "gemini-live-2.5-flash-preview"
+MODEL = "gemini-3.8-live"
 
 SYSTEM_PROMPT = """
 Bạn là Bé Na, một robot trợ lý AI thân thiện.
 Bạn đang trò chuyện với Lộc bằng tiếng Việt.
 Luôn trả lời tự nhiên, ngắn gọn, dễ hiểu.
 Gọi người dùng là Lộc.
-Không tự ý điều khiển robot khi chưa có yêu cầu rõ ràng.
+Không tự ý điều khiển robot.
 Không tự ý ra lệnh di chuyển robot.
 """
 
-
-# ==============================
-# TRANG KIỂM TRA SERVER
-# ==============================
+# =================================
+# TRANG CHỦ
+# =================================
 
 @app.get("/")
 async def home():
@@ -44,9 +44,9 @@ async def health():
     return {"status": "ok"}
 
 
-# ==============================
-# HÀM GỬI THÔNG BÁO CHO ESP32
-# ==============================
+# =================================
+# GỬI THÔNG BÁO
+# =================================
 
 async def send_message(ws, action, text):
     await ws.send_text(json.dumps({
@@ -55,9 +55,9 @@ async def send_message(ws, action, text):
     }, ensure_ascii=False))
 
 
-# ==============================
+# =================================
 # WEBSOCKET BÉ NA
-# ==============================
+# =================================
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -65,10 +65,9 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
 
     if not API_KEY:
+        print("LỖI: Chưa tìm thấy GEMINI_API_KEY")
         await send_message(
-            ws,
-            "none",
-            "Chưa cấu hình Gemini API Key."
+            ws, "none", "Chưa cấu hình Gemini API Key."
         )
         await ws.close()
         return
@@ -76,7 +75,7 @@ async def websocket_endpoint(ws: WebSocket):
     client = genai.Client(api_key=API_KEY)
 
     config = types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
+        response_modalities=[types.Modality.AUDIO],
         system_instruction=SYSTEM_PROMPT,
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig()
@@ -88,10 +87,14 @@ async def websocket_endpoint(ws: WebSocket):
 
     try:
 
+        print("Đang kết nối Gemini Live...")
+
         async with client.aio.live.connect(
             model=MODEL,
             config=config
         ) as session:
+
+            print("GEMINI CONNECTED SUCCESSFULLY")
 
             await send_message(
                 ws,
@@ -99,15 +102,16 @@ async def websocket_endpoint(ws: WebSocket):
                 "Bé Na đã kết nối bộ não AI!"
             )
 
-            # ==============================
-            # NHẬN CÂU TRẢ LỜI TỪ GEMINI
-            # ==============================
+            # =================================
+            # NHẬN PHẢN HỒI TỪ GEMINI
+            # =================================
 
             async def receive_ai():
 
                 nonlocal audio_state
 
                 try:
+
                     async for response in session.receive():
 
                         content = response.server_content
@@ -115,19 +119,21 @@ async def websocket_endpoint(ws: WebSocket):
                         if not content:
                             continue
 
-                        # Nhận nội dung văn bản
+                        # Văn bản AI trả lời
                         if content.output_transcription:
 
-                            text = content.output_transcription.text
+                            ai_text = content.output_transcription.text
 
-                            if text:
+                            if ai_text:
+                                print("BÉ NA:", ai_text)
+
                                 await send_message(
                                     ws,
                                     "none",
-                                    text
+                                    ai_text
                                 )
 
-                        # Nhận âm thanh trả lời
+                        # Âm thanh AI trả lời
                         if content.model_turn:
 
                             for part in content.model_turn.parts:
@@ -139,8 +145,7 @@ async def websocket_endpoint(ws: WebSocket):
                                     if not audio:
                                         continue
 
-                                    # Đổi âm thanh 24kHz
-                                    # thành 16kHz cho ESP32
+                                    # Chuyển 24kHz sang 16kHz
                                     audio_16k, audio_state = audioop.ratecv(
                                         audio,
                                         2,
@@ -153,27 +158,39 @@ async def websocket_endpoint(ws: WebSocket):
                                     if audio_16k:
                                         await ws.send_bytes(audio_16k)
 
-                        # Kết thúc một lượt trả lời
                         if content.turn_complete:
                             audio_state = None
+                            print("Gemini hoàn thành câu trả lời.")
 
                 except asyncio.CancelledError:
                     raise
 
                 except Exception as e:
-                    print("Lỗi nhận AI:", repr(e))
+
+                    print("LỖI NHẬN PHẢN HỒI GEMINI:")
+                    traceback.print_exc()
+
+                    try:
+                        await send_message(
+                            ws,
+                            "none",
+                            "Lỗi nhận phản hồi Gemini: " + type(e).__name__
+                        )
+                    except Exception:
+                        pass
 
             ai_task = asyncio.create_task(receive_ai())
 
-            # ==============================
+            # =================================
             # NHẬN DỮ LIỆU TỪ ESP32
-            # ==============================
+            # =================================
 
             while True:
 
                 message = await ws.receive()
 
                 if message["type"] == "websocket.disconnect":
+                    print("ESP32 đã ngắt kết nối.")
                     break
 
                 # Nhận JSON
@@ -182,34 +199,35 @@ async def websocket_endpoint(ws: WebSocket):
                     try:
                         data = json.loads(message["text"])
                     except json.JSONDecodeError:
+                        print("JSON không hợp lệ.")
                         continue
 
                     msg_type = data.get("type", "")
 
-                    # Bắt đầu nghe
                     if msg_type == "listen":
 
                         state = data.get("state", "")
 
+                        # Bắt đầu thu âm
                         if state == "start":
 
                             listening = True
                             audio_state = None
 
-                            print("Bé Na đang nghe...")
+                            print("BÉ NA ĐANG NGHE...")
 
-                        # Kết thúc nghe
+                        # Kết thúc thu âm
                         elif state == "stop":
 
                             listening = False
 
-                            print("Đã kết thúc thu âm.")
+                            print("ĐÃ KẾT THÚC THU ÂM.")
 
                             await session.send_realtime_input(
                                 audio_stream_end=True
                             )
 
-                # Nhận âm thanh từ ESP32
+                # Nhận âm thanh PCM từ ESP32
                 elif message.get("bytes") is not None:
 
                     if listening:
@@ -226,17 +244,20 @@ async def websocket_endpoint(ws: WebSocket):
                             )
 
     except WebSocketDisconnect:
-        print("ESP32 đã ngắt kết nối.")
+
+        print("WebSocket đã ngắt kết nối.")
 
     except Exception as e:
 
-        print("Lỗi Bé Na:", repr(e))
+        print("========== GEMINI ERROR ==========")
+        traceback.print_exc()
+        print("==================================")
 
         try:
             await send_message(
                 ws,
                 "none",
-                "Bé Na đang gặp lỗi kết nối AI."
+                "Lỗi kết nối AI: " + type(e).__name__
             )
         except Exception:
             pass
@@ -252,4 +273,4 @@ async def websocket_endpoint(ws: WebSocket):
                 return_exceptions=True
             )
 
-        print("Đã đóng kết nối Bé Na.")
+        print("ĐÃ ĐÓNG KẾT NỐI BÉ NA.")
