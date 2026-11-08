@@ -14,7 +14,7 @@ app = FastAPI()
 # ==============================
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
-MODEL = "gemini-3.8-live"
+MODEL = "gemini-live-2.5-flash-preview"
 
 SYSTEM_PROMPT = """
 Bạn là Bé Na, một robot trợ lý AI thân thiện.
